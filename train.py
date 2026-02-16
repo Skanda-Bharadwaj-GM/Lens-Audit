@@ -26,6 +26,12 @@ def train():
     train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
 
     model = LensAuditNet(dim=48, num_blocks=4).to(device)
+    if os.path.exists('lens_audit_latest.pth'):
+    # map_location ensures it loads correctly even if you switch between CPU/GPU
+        model.load_state_dict(torch.load('lens_audit_latest.pth', map_location=device))
+        print("[RECOVERY] Successfully loaded Epoch 1 weights. Resuming training...")
+    else:
+        print("[INFO] No checkpoint found. Starting training from scratch.")
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     criterion = LensAuditLoss(fft_weight=0.1).to(device)
 
