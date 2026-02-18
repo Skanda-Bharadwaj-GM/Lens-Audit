@@ -1,10 +1,13 @@
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 import os
+import math
+import random
+from torchvision import transforms
 from torchvision.utils import save_image
 
-# Importing your Lead Modules
+# Lead Modules
 from src.utils.dataloader import GoProDataset
 from src.ai.restormer import LensAuditNet
 from src.ai.losses import LensAuditLoss
@@ -13,80 +16,80 @@ def train():
     # --- 1. Configuration ---
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     BATCH_SIZE = 4      
-    LEARNING_RATE = 2e-4
-    EPOCHS = 5          # Reduced for efficiency as discussed
-    PATIENCE = 2        # Stop if no improvement for 2 epochs
-    DATA_ROOT = r'C:\Users\Skanda Bharadwaj G M\Downloads\IPCV\data\gopro\GOPRO_Large'
+    LEARNING_RATE = 5e-5 # Lowered for more stable fine-tuning
+    TOTAL_EPOCHS = 15    
+    LIMIT_IMAGES = 200   # The model sees 200 different images per run
     
-    os.makedirs('reports/figures', exist_ok=True)
+    DATA_ROOT = r'C:\Users\Skanda Bharadwaj G M\Downloads\IPCV\data\gopro\GOPRO_Large'
+    os.makedirs('reports/figures/Diverse_Subset', exist_ok=True)
 
-    # --- 2. Data & Model Initialization ---
-    print(f"Initializing Dataset from {DATA_ROOT}...")
-    dataset = GoProDataset(root_dir=DATA_ROOT, split='train', size=256)
-    train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
+    # --- 2. Advanced Augmentation ---
+    # Adding flips helps prevent overfitting on a small subset
+    transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.5),
+    ])
+
+    # Note: Your current GoProDataset applies CenterCrop and ToTensor. 
+    # We will wrap the output in these flips for Phase 2.
+    full_dataset = GoProDataset(root_dir=DATA_ROOT, split='train', size=256)
+
+    # --- 3. DIVERSITY LOGIC: Random Sampling ---
+    # This picks 200 random indices from the whole dataset
+    all_indices = list(range(len(full_dataset)))
+    random.shuffle(all_indices)
+    subset_indices = all_indices[:LIMIT_IMAGES]
+    
+    train_subset = Subset(full_dataset, subset_indices)
+    train_loader = DataLoader(train_subset, batch_size=BATCH_SIZE, shuffle=True,num_workers=2, pin_memory=True)
 
     model = LensAuditNet(dim=48, num_blocks=4).to(device)
     
-    # Early Stopping Variables
+    if os.path.exists('lens_audit_best.pth'):
+        model.load_state_dict(torch.load('lens_audit_best.pth', map_location=device))
+        print(f"[*] Diverse Subset Mode: Training on {LIMIT_IMAGES} random images.")
+
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3) # Added weight decay
+    criterion = LensAuditLoss(fft_weight=0.2).to(device)
+    
+    # Scheduler to slow down if loss plateaus
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
+
     best_loss = float('inf')
-    patience_counter = 0
 
-    # Load Weights for Recovery
-    if os.path.exists('lens_audit_latest.pth'):
-        model.load_state_dict(torch.load('lens_audit_latest.pth', map_location=device))
-        print("[RECOVERY] Successfully loaded weights. Resuming training...")
-    else:
-        print("[INFO] No checkpoint found. Starting from scratch.")
-
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
-    criterion = LensAuditLoss(fft_weight=0.1).to(device)
-
-    print(f"Starting Training on {device}. Total Batches: {len(train_loader)}")
-
-    # --- 3. Training Loop ---
-    for epoch in range(EPOCHS):
+    # --- 4. Loop ---
+    for epoch in range(5, 5 + TOTAL_EPOCHS):
         model.train()
         epoch_loss = 0
         
         for i, (blur, sharp) in enumerate(train_loader):
             blur, sharp = blur.to(device), sharp.to(device)
+            
+            # Apply Augmentation manually if not in Dataloader
+            if random.random() > 0.5:
+                blur = torch.flip(blur, [3])
+                sharp = torch.flip(sharp, [3])
 
             optimizer.zero_grad()
             restored = model(blur)
             loss = criterion(restored, sharp)
             loss.backward()
             optimizer.step()
-
             epoch_loss += loss.item()
 
-            if i % 10 == 0:
-                print(f"Epoch [{epoch+1}/{EPOCHS}] Step [{i}/{len(train_loader)}] Loss: {loss.item():.4f}")
+            if i % 5 == 0:
+                print(f"E[{epoch+1}] Step[{i}/{len(train_loader)}] Loss: {loss.item():.4f}")
 
-            if i % 500 == 0:
-                comparison = torch.cat([blur[0:1], restored[0:1], sharp[0:1]], dim=3)
-                save_image(comparison, f'reports/figures/progress_ep{epoch+1}_step{i}.png')
-
-        # --- 4. Early Stopping & Checkpoint Logic ---
         avg_loss = epoch_loss / len(train_loader)
-        print(f"--- Epoch {epoch+1} Finished. Avg Loss: {avg_loss:.4f} ---")
+        scheduler.step()
         
-        # Save 'latest' for recovery safety
-        torch.save(model.state_dict(), 'lens_audit_latest.pth')
-
-        # Check if this is the "Best" model so far
+        # Save a sample to see progress
+        comparison = torch.cat([blur[0:1], restored[0:1], sharp[0:1]], dim=3)
+        save_image(comparison, f'reports/figures/Diverse_Subset/ep{epoch+1}.png')
+        
         if avg_loss < best_loss:
             best_loss = avg_loss
-            torch.save(model.state_dict(), 'lens_audit_best.pth')
-            print(f"[*] NEW BEST: Model saved as 'lens_audit_best.pth' (Loss: {best_loss:.4f})")
-            patience_counter = 0 # Reset counter because we improved
-        else:
-            patience_counter += 1
-            print(f"[!] No improvement. Patience: {patience_counter}/{PATIENCE}")
-
-        # Trigger Early Stopping
-        if patience_counter >= PATIENCE:
-            print(f"Early stopping triggered. Model has stabilized at Loss: {best_loss:.4f}")
-            break
+            torch.save(model.state_dict(), 'lens_audit_diverse_best.pth')
 
 if __name__ == "__main__":
     train()
